@@ -1,4 +1,4 @@
-# ✍️ Motley Fool AI Copywriter — Pro Edition v4.5 (Patched)
+# ✍️ Motley Fool AI Copywriter — Pro Edition v4.6 (Fixes Update Bug)
 # ----------------------------------------------------------
 # • Internal Plan (chain‑of‑thought) stage
 # • JSON {plan, copy} separation
@@ -7,8 +7,9 @@
 # • Unique keys for every button (resolves duplicate‑ID error)
 # • Few‑shot “Reference Winner” exemplars for email & sales pages
 # • Slider behaviour driven by external traits_config.json (3‑band logic)
-# • [NEW] Persistent Session State for Variants
-# • [NEW] Smart Markdown-to-DOCX conversion
+# • Persistent Session State for Variants
+# • Smart Markdown-to-DOCX conversion
+# • [FIX] Newline Sanitizer for Update/Revise mode
 # ----------------------------------------------------------
 
 import time, json, pathlib, re
@@ -27,8 +28,6 @@ USE_STREAMING = False     # live token stream
 AUTO_QA      = True       # self‑critique & auto‑fix loop
 
 # ---- Model & token ceiling ---------------------------------
-# UPDATED: 'gpt-4.1' is not a standard alias. Using 'gpt-4-turbo' for safety.
-# UPDATED: Max output tokens capped at 4096 (standard limit) to prevent API errors.
 MAX_OUTPUT_TOKENS = 4096
 
 # ---- Length buckets (words) --------------------------------
@@ -44,7 +43,7 @@ LENGTH_RULES = {
 # 1.  OpenAI client & config
 # ────────────────────────────────────────────────────────────
 client = OpenAI(api_key=st.secrets.openai_api_key)
-OPENAI_MODEL = st.secrets.get("openai_model", "gpt-4-turbo")
+OPENAI_MODEL = st.secrets.get("openai_model", "gpt-4o")
 
 # ────────────────────────────────────────────────────────────
 # 1A.  Load slider‑rule configuration (With Error Handling)
@@ -78,7 +77,6 @@ def _init(**defaults):
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
 
-# UPDATED: Added 'variants' to session state to fix vanishing bug
 _init(generated_copy="", adapted_copy="", internal_plan="", length_choice="", variants=None)
 
 def line(label: str, value: str) -> str:
@@ -88,10 +86,6 @@ def line(label: str, value: str) -> str:
 # 3A.  Slider‑rule helpers (json‑driven)
 # ────────────────────────────────────────────────────────────
 def trait_rules(traits: dict) -> list[str]:
-    """
-    Return Hard‑Requirement rule strings triggered by slider settings.
-    Implements 3‑band logic (high / medium / low) based on traits_config.json
-    """
     out: list[str] = []
     for name, score in traits.items():
         cfg = TRAIT_CFG.get(name)
@@ -109,7 +103,6 @@ def trait_rules(traits: dict) -> list[str]:
     return out
 
 def allow_exemplar(traits: dict) -> bool:
-    """True if *any* trait permits high‑level exemplars and slider meets threshold."""
     for name, score in traits.items():
         cfg = TRAIT_CFG.get(name, {})
         if cfg.get("high_exemplar_allowed") and score >= cfg["high_threshold"]:
@@ -185,18 +178,12 @@ TRAIT_EXAMPLES = {
     ],
 }
 
-# UPDATED: This function is now fully dynamic based on traits_config.json
 def trait_guide(traits: dict) -> str:
     out = []
     for i, (name, score) in enumerate(traits.items(), 1):
         cfg = TRAIT_CFG.get(name, {})
-        # Dynamic threshold check
         high_thresh = cfg.get("high_threshold", 8)
-        
-        # If score is very high (>= high_thresh), show 3 examples.
-        # If score is moderately high, show 2. Else 1.
         shots = 3 if score >= high_thresh else 2 if score >= (high_thresh - 3) else 1
-        
         examples = " / ".join(f"“{s}”" for s in TRAIT_EXAMPLES.get(name, [])[:shots])
         out.append(f"{i}. {name.replace('_',' ')} ({score}/10) — e.g. {examples}")
     return "\n".join(out)
@@ -231,9 +218,6 @@ Scroll down and you’ll see why the Silver Pass could be your portfolio’s inf
 **Yes! Secure My Pass Now**
 """.strip()
 
-# --- Reference winners (few‑shot exemplars) -----------------
-# UPDATED: Replaced empty placeholders with Micro demos to prevent LLM confusion.
-# TODO: User should paste full-length "Winner" copy here for best results.
 SALES_WINNER = SALES_MICRO 
 EMAIL_WINNER = EMAIL_MICRO
 
@@ -260,14 +244,23 @@ SALES_STRUCT = """
 def build_prompt(copy_type, copy_struct, traits, brief, length_choice, original=None):
     exemplar = EMAIL_MICRO if copy_type.startswith("📧") else SALES_MICRO
 
-    # --- attach few‑shot winners only when allowed -------------
     if allow_exemplar(traits):
         exemplar += "\n\n" + (SALES_WINNER if copy_type == "📝 Sales Page" else EMAIL_WINNER)
-    # -----------------------------------------------------------
 
     hard_list = trait_rules(traits)
     hard_block = "#### Hard Requirements\n" + "\n".join(hard_list) if hard_list else ""
-    edit_block = f"\n\n### ORIGINAL COPY\n{original}\n### END ORIGINAL" if original else ""
+    
+    # [FIX] Enhanced instruction for Updates to prevent format drift
+    if original:
+        edit_block = f"""
+\n\n### ORIGINAL COPY TO REVISE
+{original}
+### INSTRUCTION:
+Rewrite the copy above using the new trait requirements. 
+IMPORTANT: You MUST preserve the Markdown structure (Headings, Bullets) used in the original.
+"""
+    else:
+        edit_block = ""
 
     min_len, max_len = LENGTH_RULES[length_choice]
     length_block = (f"#### Length Requirement\nWrite between **{min_len} and {max_len} words**."
@@ -289,6 +282,8 @@ def build_prompt(copy_type, copy_struct, traits, brief, length_choice, original=
 
 {length_block}
 
+{edit_block}
+
 Please limit bullet lists to three or fewer and favour full‑sentence paragraphs elsewhere.
 
 ### END INSTRUCTIONS
@@ -298,7 +293,7 @@ Please limit bullet lists to three or fewer and favour full‑sentence paragraph
 # 6.  Unified LLM helper
 # ────────────────────────────────────────────────────────────
 def run_chat(messages, stream=False, expect_json=False, max_tokens=MAX_OUTPUT_TOKENS):
-    for attempt in range(3): # Reduced retries to 3 for speed
+    for attempt in range(3):
         try:
             kwargs = {"max_tokens": max_tokens}
             if expect_json:
@@ -321,7 +316,6 @@ def self_qa(draft, copy_type):
         return draft
 
     min_len, _ = LENGTH_RULES.get(st.session_state.length_choice, (0, None))
-    # Simple check: if draft is drastically short (50% of min), force expand
     word_count = len(draft.split())
     if min_len and word_count < (min_len * 0.5):
         crit = f"- Draft is only {word_count} words (Target: {min_len}). Please expand significantly."
@@ -391,18 +385,13 @@ def create_docx(text):
     style.font.name = 'Calibri'
     style.font.size = Pt(11)
 
-    # Simple parser to convert Markdown headings to Docx headings
     lines = text.split('\n')
     for line in lines:
-        # Detect headers ## or ###
         header_match = re.match(r'^(#{2,4})\s+(.*)', line)
         if header_match:
-            level = len(header_match.group(1)) - 1 # ## -> Heading 1
+            level = len(header_match.group(1)) - 1
             doc.add_heading(header_match.group(2), level=level)
         else:
-            # Clean bolding **text** to just text for now (simple cleanup)
-            # A full markdown parser would be needed for perfect bolding, 
-            # but this is better than raw stars.
             clean_line = line.replace('**', '') 
             if clean_line.strip():
                 doc.add_paragraph(clean_line)
@@ -418,7 +407,6 @@ def create_docx(text):
 tab_gen, tab_adapt = st.tabs(["✍️ Generate Copy", "🌐 Adapt Copy"])
 
 with tab_gen:
-    # --- Sliders
     with st.sidebar.expander("🎚️ Linguistic Trait Intensity", True):
         with st.form("trait_form"):
             trait_scores = {
@@ -433,7 +421,6 @@ with tab_gen:
             }
             update_traits = st.form_submit_button("🔄 Update Copy")
 
-    # --- Inputs
     country   = st.selectbox("🌐 Target Country", list(COUNTRY_RULES))
     copy_type = st.selectbox("Copy Type", ["📧 Email", "📝 Sales Page"])
     length_choice = st.selectbox("Desired Length", list(LENGTH_RULES))
@@ -465,7 +452,6 @@ with tab_gen:
 
     # ────────── Core generator ────────── #
     def generate(old=None):
-        # UPDATED: Validation to prevent bad inputs
         if not hook.strip() or not details.strip():
             st.warning("⚠️ Please provide at least a 'Campaign Hook' and 'Product Details' before generating.")
             return None
@@ -477,8 +463,7 @@ with tab_gen:
         1. Create a concise INTERNAL bullet plan covering:
            • Hook & opening flow
            • Placement of proof, urgency, CTA
-           • Any standout stats, metaphors, social proof you intend to use
-        2. Then write the final copy.
+           2. Then write the final copy.
 
         Respond ONLY as valid JSON with exactly two keys:
         {
@@ -494,7 +479,6 @@ with tab_gen:
              "content": user_instr + "\n\n" + prompt_core}
         ]
 
-        # ---- Spinner #1: draft generation -------------------
         with st.spinner("Crafting copy…"):
             raw_json = run_chat(msgs, expect_json=True)
 
@@ -507,9 +491,14 @@ with tab_gen:
 
         st.session_state.internal_plan = data["plan"].strip()
 
-        # ---- Spinner #2: QA & polish ------------------------
+        # [FIX] Sanitize Newlines: LLMs often double-escape newlines in JSON updates
+        # e.g., turning a real line break into the characters "\n".
+        raw_copy = data["copy"].strip()
+        if "\\n" in raw_copy:
+             raw_copy = raw_copy.replace("\\n", "\n")
+
         with st.spinner("Polishing copy…"):
-            draft = self_qa(data["copy"].strip(), copy_type)
+            draft = self_qa(raw_copy, copy_type)
 
             if show_critique:
                 crit = client.chat.completions.create(
@@ -525,7 +514,6 @@ with tab_gen:
                 ).choices[0].message.content
                 st.info(crit)
         
-        # Clear old variants when new copy is generated
         st.session_state.variants = None
         return draft
 
@@ -534,6 +522,7 @@ with tab_gen:
         result = generate()
         if result: st.session_state.generated_copy = result
 
+    # The update button logic
     if update_traits and st.session_state.generated_copy:
         result = generate(st.session_state.generated_copy)
         if result: st.session_state.generated_copy = result
@@ -548,7 +537,6 @@ with tab_gen:
 
         st.code(st.session_state.generated_copy, language="markdown")
 
-        # --- UPDATED: Persistent Variants Logic ---
         if st.button("🎯 Generate 5 Alt Headlines & CTAs", key="gen_variants_btn"):
             with st.spinner("Brainstorming variants…"):
                 st.session_state.variants = generate_variants(st.session_state.generated_copy)
@@ -568,12 +556,8 @@ with tab_gen:
                     st.markdown(f"**{i+1}.** {text}")
                     st.radio(f"Vote C{i}", ["👍", "👎"], key=f"c_vote_{i}", horizontal=True, label_visibility="collapsed")
 
-        # --- UPDATED: Smart DOCX Download ---
         col1, col2 = st.columns(2)
-        
-        # Prepare the DOCX in memory
         docx_file = create_docx(st.session_state.generated_copy)
-        
         col1.download_button("📥 Download DOCX", docx_file, "mf_copy.docx",
                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                key="gen_download")
@@ -618,10 +602,7 @@ with tab_adapt:
         st.markdown(st.session_state.adapted_copy)
 
         b1, b2 = st.columns(2)
-        
-        # Smart DOCX for adaptation
         adapt_docx = create_docx(st.session_state.adapted_copy)
-        
         b1.download_button("📥 Download DOCX", adapt_docx, "mf_adapted.docx",
                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                key="adapt_download")
