@@ -1,4 +1,4 @@
-# ✍️ Motley Fool AI Copywriter — Pro Edition v4.4.1
+# ✍️ Motley Fool AI Copywriter — Pro Edition v4.5 (Patched)
 # ----------------------------------------------------------
 # • Internal Plan (chain‑of‑thought) stage
 # • JSON {plan, copy} separation
@@ -7,15 +7,18 @@
 # • Unique keys for every button (resolves duplicate‑ID error)
 # • Few‑shot “Reference Winner” exemplars for email & sales pages
 # • Slider behaviour driven by external traits_config.json (3‑band logic)
+# • [NEW] Persistent Session State for Variants
+# • [NEW] Smart Markdown-to-DOCX conversion
 # ----------------------------------------------------------
 
-import time, json, pathlib
+import time, json, pathlib, re
 from io import BytesIO
 from textwrap import dedent
 
 import streamlit as st
 from openai import OpenAI
 from docx import Document
+from docx.shared import Pt
 
 # ────────────────────────────────────────────────────────────
 # 0.  Global toggles
@@ -24,7 +27,9 @@ USE_STREAMING = False     # live token stream
 AUTO_QA      = True       # self‑critique & auto‑fix loop
 
 # ---- Model & token ceiling ---------------------------------
-MAX_OUTPUT_TOKENS = 10_000   # safe for GPT‑4‑32k context
+# UPDATED: 'gpt-4.1' is not a standard alias. Using 'gpt-4-turbo' for safety.
+# UPDATED: Max output tokens capped at 4096 (standard limit) to prevent API errors.
+MAX_OUTPUT_TOKENS = 4096
 
 # ---- Length buckets (words) --------------------------------
 LENGTH_RULES = {
@@ -32,19 +37,23 @@ LENGTH_RULES = {
     "📐 Medium (200–500 words)":       (200, 550),
     "📖 Long (500–1500 words)":        (500, 1600),
     "📚 Extra Long (1500–3000 words)": (1500, 3200),
-    "📜 Scrolling Monster (3000+ words)": (3000, None),  # None = open‑ended
+    "📜 Scrolling Monster (3000+ words)": (3000, None),
 }
 
 # ────────────────────────────────────────────────────────────
 # 1.  OpenAI client & config
 # ────────────────────────────────────────────────────────────
 client = OpenAI(api_key=st.secrets.openai_api_key)
-OPENAI_MODEL = st.secrets.get("openai_model", "gpt-4.1")
+OPENAI_MODEL = st.secrets.get("openai_model", "gpt-4-turbo")
 
 # ────────────────────────────────────────────────────────────
-# 1A.  Load slider‑rule configuration
+# 1A.  Load slider‑rule configuration (With Error Handling)
 # ────────────────────────────────────────────────────────────
-TRAIT_CFG = json.loads(pathlib.Path("traits_config.json").read_text())
+try:
+    TRAIT_CFG = json.loads(pathlib.Path("traits_config.json").read_text())
+except Exception as e:
+    st.error(f"🚨 CRITICAL ERROR: Could not load 'traits_config.json'.\nDetails: {e}")
+    st.stop()
 
 # ────────────────────────────────────────────────────────────
 # 2.  Streamlit page & CSS
@@ -69,7 +78,8 @@ def _init(**defaults):
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
 
-_init(generated_copy="", adapted_copy="", internal_plan="", length_choice="")
+# UPDATED: Added 'variants' to session state to fix vanishing bug
+_init(generated_copy="", adapted_copy="", internal_plan="", length_choice="", variants=None)
 
 def line(label: str, value: str) -> str:
     return f"- {label}: {value}\n" if value.strip() else ""
@@ -88,13 +98,11 @@ def trait_rules(traits: dict) -> list[str]:
         if not cfg:
             continue
 
-        # ★ UPDATED — three‑band evaluation
         if score >= cfg["high_threshold"]:
             out.append(cfg["high_rule"])
         elif score <= cfg["low_threshold"]:
             out.append(cfg["low_rule"])
         else:
-            # mid‑band present?
             mid_rule = cfg.get("mid_rule")
             if mid_rule:
                 out.append(mid_rule)
@@ -134,7 +142,6 @@ At the very end of the piece, append this italic line (no quotes):
 *Past performance is not a reliable indicator of future results.*
 """).strip()
 
-# --- Trait exemplars (3 each) --------------------------------
 TRAIT_EXAMPLES = {
     "Urgency": [
         "This isn't a drill — once midnight hits, your chance to secure these savings is gone forever.",
@@ -178,11 +185,19 @@ TRAIT_EXAMPLES = {
     ],
 }
 
+# UPDATED: This function is now fully dynamic based on traits_config.json
 def trait_guide(traits: dict) -> str:
     out = []
     for i, (name, score) in enumerate(traits.items(), 1):
-        shots = 3 if score >= 8 else 2 if score >= 4 else 1
-        examples = " / ".join(f"“{s}”" for s in TRAIT_EXAMPLES[name][:shots])
+        cfg = TRAIT_CFG.get(name, {})
+        # Dynamic threshold check
+        high_thresh = cfg.get("high_threshold", 8)
+        
+        # If score is very high (>= high_thresh), show 3 examples.
+        # If score is moderately high, show 2. Else 1.
+        shots = 3 if score >= high_thresh else 2 if score >= (high_thresh - 3) else 1
+        
+        examples = " / ".join(f"“{s}”" for s in TRAIT_EXAMPLES.get(name, [])[:shots])
         out.append(f"{i}. {name.replace('_',' ')} ({score}/10) — e.g. {examples}")
     return "\n".join(out)
 
@@ -217,8 +232,10 @@ Scroll down and you’ll see why the Silver Pass could be your portfolio’s inf
 """.strip()
 
 # --- Reference winners (few‑shot exemplars) -----------------
-SALES_WINNER = """(same as before)""".strip()
-EMAIL_WINNER = """(same as before)""".strip()
+# UPDATED: Replaced empty placeholders with Micro demos to prevent LLM confusion.
+# TODO: User should paste full-length "Winner" copy here for best results.
+SALES_WINNER = SALES_MICRO 
+EMAIL_WINNER = EMAIL_MICRO
 
 # --- Structural skeletons -----------------------------------
 EMAIL_STRUCT = """
@@ -281,28 +298,20 @@ Please limit bullet lists to three or fewer and favour full‑sentence paragraph
 # 6.  Unified LLM helper
 # ────────────────────────────────────────────────────────────
 def run_chat(messages, stream=False, expect_json=False, max_tokens=MAX_OUTPUT_TOKENS):
-    for attempt in range(5):
+    for attempt in range(3): # Reduced retries to 3 for speed
         try:
-            if stream:
-                resp = client.chat.completions.create(model=OPENAI_MODEL,
-                                                      messages=messages,
-                                                      stream=True,
-                                                      max_tokens=max_tokens)
-                ph, text = st.empty(), ""
-                for c in resp:
-                    text += c.choices[0].delta.content or ""
-                    ph.markdown(text)
-                return text.strip()
-            else:
-                kwargs = {"max_tokens": max_tokens}
-                if expect_json:
-                    kwargs["response_format"] = {"type": "json_object"}
-                resp = client.chat.completions.create(model=OPENAI_MODEL,
-                                                      messages=messages,
-                                                      **kwargs)
-                return resp.choices[0].message.content.strip()
-        except Exception:
-            time.sleep(2 ** attempt)
+            kwargs = {"max_tokens": max_tokens}
+            if expect_json:
+                kwargs["response_format"] = {"type": "json_object"}
+            
+            resp = client.chat.completions.create(model=OPENAI_MODEL,
+                                                  messages=messages,
+                                                  **kwargs)
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            if attempt == 2: st.error(f"OpenAI API Error: {e}")
+            time.sleep(1 + attempt)
+    return ""
 
 # ────────────────────────────────────────────────────────────
 # 7A.  AI Pair‑editor
@@ -312,8 +321,10 @@ def self_qa(draft, copy_type):
         return draft
 
     min_len, _ = LENGTH_RULES.get(st.session_state.length_choice, (0, None))
-    if min_len and len(draft.split()) < min_len:
-        crit = f"- Draft is only {len(draft.split())} words (< {min_len}). Please expand."
+    # Simple check: if draft is drastically short (50% of min), force expand
+    word_count = len(draft.split())
+    if min_len and word_count < (min_len * 0.5):
+        crit = f"- Draft is only {word_count} words (Target: {min_len}). Please expand significantly."
     else:
         crit = ""
 
@@ -372,6 +383,36 @@ Return JSON: {{ "headlines": [...], "ctas": [...] }}
     return json.loads(resp.choices[0].message.content)
 
 # ────────────────────────────────────────────────────────────
+# 7C.  Smart DOCX Exporter
+# ────────────────────────────────────────────────────────────
+def create_docx(text):
+    doc = Document()
+    style = doc.styles['Normal']
+    style.font.name = 'Calibri'
+    style.font.size = Pt(11)
+
+    # Simple parser to convert Markdown headings to Docx headings
+    lines = text.split('\n')
+    for line in lines:
+        # Detect headers ## or ###
+        header_match = re.match(r'^(#{2,4})\s+(.*)', line)
+        if header_match:
+            level = len(header_match.group(1)) - 1 # ## -> Heading 1
+            doc.add_heading(header_match.group(2), level=level)
+        else:
+            # Clean bolding **text** to just text for now (simple cleanup)
+            # A full markdown parser would be needed for perfect bolding, 
+            # but this is better than raw stars.
+            clean_line = line.replace('**', '') 
+            if clean_line.strip():
+                doc.add_paragraph(clean_line)
+    
+    buf = BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
+
+# ────────────────────────────────────────────────────────────
 # 8.  UI – Generate tab
 # ────────────────────────────────────────────────────────────
 tab_gen, tab_adapt = st.tabs(["✍️ Generate Copy", "🌐 Adapt Copy"])
@@ -424,6 +465,11 @@ with tab_gen:
 
     # ────────── Core generator ────────── #
     def generate(old=None):
+        # UPDATED: Validation to prevent bad inputs
+        if not hook.strip() or not details.strip():
+            st.warning("⚠️ Please provide at least a 'Campaign Hook' and 'Product Details' before generating.")
+            return None
+
         prompt_core = build_prompt(copy_type, copy_struct,
                                    trait_scores, brief(), length_choice, old)
         user_instr = dedent("""
@@ -452,6 +498,8 @@ with tab_gen:
         with st.spinner("Crafting copy…"):
             raw_json = run_chat(msgs, expect_json=True)
 
+        if not raw_json: return None
+
         try:
             data = json.loads(raw_json)
         except json.JSONDecodeError:
@@ -463,7 +511,6 @@ with tab_gen:
         with st.spinner("Polishing copy…"):
             draft = self_qa(data["copy"].strip(), copy_type)
 
-            # ---- Optional critique (moved *inside* same spinner) ----
             if show_critique:
                 crit = client.chat.completions.create(
                     model=OPENAI_MODEL,
@@ -477,58 +524,64 @@ with tab_gen:
         """}]
                 ).choices[0].message.content
                 st.info(crit)
-        # ------------------------------------------------------------
-
+        
+        # Clear old variants when new copy is generated
+        st.session_state.variants = None
         return draft
 
     # --- Buttons
     if st.button("✨ Generate Copy", key="gen_generate"):
-        st.session_state.generated_copy = generate()
+        result = generate()
+        if result: st.session_state.generated_copy = result
 
     if update_traits and st.session_state.generated_copy:
-        st.session_state.generated_copy = generate(st.session_state.generated_copy)
+        result = generate(st.session_state.generated_copy)
+        if result: st.session_state.generated_copy = result
 
     # --- Display & post‑gen tools
     if st.session_state.generated_copy:
         st.subheader("📝 Current Copy")
         st.markdown(st.session_state.generated_copy)
 
-        # ---------- NEW: optional chain‑of‑thought ----------------
         with st.expander("🔍 Show Internal Plan (AI outline)"):
             st.markdown(st.session_state.internal_plan or "_No plan captured_")
-        # ----------------------------------------------------------
 
         st.code(st.session_state.generated_copy, language="markdown")
 
-        # variant grid
-        if st.button("🎯 Generate 5 Alt Headlines & CTAs", key="gen_variants"):
+        # --- UPDATED: Persistent Variants Logic ---
+        if st.button("🎯 Generate 5 Alt Headlines & CTAs", key="gen_variants_btn"):
             with st.spinner("Brainstorming variants…"):
-                variants = generate_variants(st.session_state.generated_copy)
+                st.session_state.variants = generate_variants(st.session_state.generated_copy)
 
+        if st.session_state.variants:
             st.subheader("📰 Headline Ideas")
             cols = st.columns(5)
-            for i, text in enumerate(variants["headlines"]):
+            for i, text in enumerate(st.session_state.variants["headlines"]):
                 with cols[i]:
                     st.markdown(f"**{i+1}.** {text}")
-                    st.radio(f"head_{i}", ["👍", "👎"], horizontal=True, label_visibility="collapsed")
+                    st.radio(f"Vote H{i}", ["👍", "👎"], key=f"h_vote_{i}", horizontal=True, label_visibility="collapsed")
 
             st.subheader("🔘 CTA Button Ideas")
             cols = st.columns(5)
-            for i, text in enumerate(variants["ctas"]):
+            for i, text in enumerate(st.session_state.variants["ctas"]):
                 with cols[i]:
                     st.markdown(f"**{i+1}.** {text}")
-                    st.radio(f"cta_{i}", ["👍", "👎"], horizontal=True, label_visibility="collapsed")
+                    st.radio(f"Vote C{i}", ["👍", "👎"], key=f"c_vote_{i}", horizontal=True, label_visibility="collapsed")
 
+        # --- UPDATED: Smart DOCX Download ---
         col1, col2 = st.columns(2)
-        if col1.button("💾 Save DOCX", key="gen_save"):
-            doc = Document(); doc.add_paragraph(st.session_state.generated_copy)
-            buf = BytesIO(); doc.save(buf); buf.seek(0)
-            st.download_button("📥 Download DOCX", buf, "mf_copy.docx",
+        
+        # Prepare the DOCX in memory
+        docx_file = create_docx(st.session_state.generated_copy)
+        
+        col1.download_button("📥 Download DOCX", docx_file, "mf_copy.docx",
                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                key="gen_download")
+
         if col2.button("🗑️ Clear", key="gen_clear"):
             st.session_state.generated_copy = ""
             st.session_state.internal_plan = ""
+            st.session_state.variants = None
             st.experimental_rerun()
 
 # ────────────────────────────────────────────────────────────
@@ -565,11 +618,13 @@ with tab_adapt:
         st.markdown(st.session_state.adapted_copy)
 
         b1, b2 = st.columns(2)
-        if b1.button("💾 Save DOCX", key="adapt_save"):
-            doc = Document(); doc.add_paragraph(st.session_state.adapted_copy)
-            buf = BytesIO(); doc.save(buf); buf.seek(0)
-            st.download_button("📥 Download DOCX", buf, "mf_adapted.docx",
+        
+        # Smart DOCX for adaptation
+        adapt_docx = create_docx(st.session_state.adapted_copy)
+        
+        b1.download_button("📥 Download DOCX", adapt_docx, "mf_adapted.docx",
                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                key="adapt_download")
+                               
         if b2.button("🗑️ Clear Adapted", key="adapt_clear"):
             st.session_state.adapted_copy = ""
