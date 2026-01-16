@@ -1,15 +1,16 @@
-# ✍️ Motley Fool AI Copywriter — Pro Edition v4.6 (Fixes Update Bug)
+# ✍️ Motley Fool AI Copywriter — Pro Edition v5.1 (Gemini 3 Flash Preview)
 # ----------------------------------------------------------
+# • Dual-Engine: Switch between OpenAI (GPT-4) and Google (Gemini 3 Flash)
 # • Internal Plan (chain‑of‑thought) stage
-# • JSON {plan, copy} separation
+# • JSON {plan, copy} separation with Native JSON Mode for both engines
 # • Dynamic word‑count enforcement tied to dropdown
 # • Dual spinners for clearer progress feedback
 # • Unique keys for every button (resolves duplicate‑ID error)
 # • Few‑shot “Reference Winner” exemplars for email & sales pages
-# • Slider behaviour driven by external traits_config.json (3‑band logic)
+# • Slider behaviour driven by external traits_config.json
 # • Persistent Session State for Variants
 # • Smart Markdown-to-DOCX conversion
-# • [FIX] Newline Sanitizer for Update/Revise mode
+# • Newline Sanitizer for Update/Revise mode
 # ----------------------------------------------------------
 
 import time, json, pathlib, re
@@ -17,9 +18,11 @@ from io import BytesIO
 from textwrap import dedent
 
 import streamlit as st
+import google.generativeai as genai
 from openai import OpenAI
 from docx import Document
 from docx.shared import Pt
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
 # ────────────────────────────────────────────────────────────
 # 0.  Global toggles
@@ -40,13 +43,23 @@ LENGTH_RULES = {
 }
 
 # ────────────────────────────────────────────────────────────
-# 1.  OpenAI client & config
+# 1.  Clients & Config
 # ────────────────────────────────────────────────────────────
-client = OpenAI(api_key=st.secrets.openai_api_key)
-OPENAI_MODEL = st.secrets.get("openai_model", "gpt-4o")
+
+# --- OpenAI Init ---
+try:
+    openai_client = OpenAI(api_key=st.secrets.openai_api_key)
+except Exception:
+    openai_client = None # Handle gracefully if user only wants Gemini
+
+# --- Google Gemini Init ---
+GOOGLE_AVAILABLE = False
+if "google_api_key" in st.secrets:
+    genai.configure(api_key=st.secrets.google_api_key)
+    GOOGLE_AVAILABLE = True
 
 # ────────────────────────────────────────────────────────────
-# 1A.  Load slider‑rule configuration (With Error Handling)
+# 1A.  Load slider‑rule configuration
 # ────────────────────────────────────────────────────────────
 try:
     TRAIT_CFG = json.loads(pathlib.Path("traits_config.json").read_text())
@@ -83,14 +96,13 @@ def line(label: str, value: str) -> str:
     return f"- {label}: {value}\n" if value.strip() else ""
 
 # ────────────────────────────────────────────────────────────
-# 3A.  Slider‑rule helpers (json‑driven)
+# 3A.  Slider‑rule helpers
 # ────────────────────────────────────────────────────────────
 def trait_rules(traits: dict) -> list[str]:
     out: list[str] = []
     for name, score in traits.items():
         cfg = TRAIT_CFG.get(name)
-        if not cfg:
-            continue
+        if not cfg: continue
 
         if score >= cfg["high_threshold"]:
             out.append(cfg["high_rule"])
@@ -98,8 +110,7 @@ def trait_rules(traits: dict) -> list[str]:
             out.append(cfg["low_rule"])
         else:
             mid_rule = cfg.get("mid_rule")
-            if mid_rule:
-                out.append(mid_rule)
+            if mid_rule: out.append(mid_rule)
     return out
 
 def allow_exemplar(traits: dict) -> bool:
@@ -188,7 +199,7 @@ def trait_guide(traits: dict) -> str:
         out.append(f"{i}. {name.replace('_',' ')} ({score}/10) — e.g. {examples}")
     return "\n".join(out)
 
-# --- Micro demos --------------------------------------------
+# --- Micro demos & Winners ----------------------------------
 EMAIL_MICRO = """
 ### Example Email
 **Subject Line:** Last chance to lock in $119 Motley Fool membership  
@@ -243,14 +254,13 @@ SALES_STRUCT = """
 # ────────────────────────────────────────────────────────────
 def build_prompt(copy_type, copy_struct, traits, brief, length_choice, original=None):
     exemplar = EMAIL_MICRO if copy_type.startswith("📧") else SALES_MICRO
-
     if allow_exemplar(traits):
         exemplar += "\n\n" + (SALES_WINNER if copy_type == "📝 Sales Page" else EMAIL_WINNER)
 
     hard_list = trait_rules(traits)
     hard_block = "#### Hard Requirements\n" + "\n".join(hard_list) if hard_list else ""
     
-    # [FIX] Enhanced instruction for Updates to prevent format drift
+    # Enhanced instruction for Updates to prevent format drift
     if original:
         edit_block = f"""
 \n\n### ORIGINAL COPY TO REVISE
@@ -290,30 +300,87 @@ Please limit bullet lists to three or fewer and favour full‑sentence paragraph
 """.strip()
 
 # ────────────────────────────────────────────────────────────
-# 6.  Unified LLM helper
+# 6.  Unified LLM helper (Supports OpenAI & Gemini)
 # ────────────────────────────────────────────────────────────
-def run_chat(messages, stream=False, expect_json=False, max_tokens=MAX_OUTPUT_TOKENS):
-    for attempt in range(3):
-        try:
-            kwargs = {"max_tokens": max_tokens}
-            if expect_json:
-                kwargs["response_format"] = {"type": "json_object"}
+def run_chat(messages, engine, expect_json=False, max_tokens=MAX_OUTPUT_TOKENS):
+    """
+    Handles request dispatch to either OpenAI or Gemini.
+    """
+    
+    # --- PATH A: OPENAI ---
+    if engine == "OpenAI (GPT-4)":
+        if not openai_client:
+            st.error("OpenAI API Key missing.")
+            return ""
             
-            resp = client.chat.completions.create(model=OPENAI_MODEL,
-                                                  messages=messages,
-                                                  **kwargs)
-            return resp.choices[0].message.content.strip()
-        except Exception as e:
-            if attempt == 2: st.error(f"OpenAI API Error: {e}")
-            time.sleep(1 + attempt)
-    return ""
+        kwargs = {"max_tokens": max_tokens}
+        if expect_json:
+            kwargs["response_format"] = {"type": "json_object"}
+        
+        # Retry loop for OpenAI
+        for attempt in range(3):
+            try:
+                resp = openai_client.chat.completions.create(
+                    model=st.secrets.get("openai_model", "gpt-4-turbo"),
+                    messages=messages,
+                    **kwargs
+                )
+                return resp.choices[0].message.content.strip()
+            except Exception as e:
+                time.sleep(1 + attempt)
+        return ""
+
+    # --- PATH B: GOOGLE GEMINI ---
+    elif engine == "Google (Gemini 3)":
+        if not GOOGLE_AVAILABLE:
+            st.error("Google API Key missing in secrets.toml.")
+            return ""
+
+        # 1. Extract System Instruction vs User Prompt
+        sys_msg = next((m['content'] for m in messages if m['role'] == 'system'), "")
+        user_prompt = "\n\n".join([m['content'] for m in messages if m['role'] != 'system'])
+
+        # 2. Configure Model - Uses your specific requested model
+        # Falls back to secrets or hardcoded string
+        model_name = st.secrets.get("google_model", "gemini-3-flash-preview")
+        
+        # 3. Safety Settings (Important for Copywriting)
+        # We need to permit "Urgency" (Hype) without triggering Harassment filters
+        safety_config = {
+            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+        }
+
+        # 4. Generation Config
+        gen_config = genai.GenerationConfig(
+            temperature=0.7,
+            max_output_tokens=max_tokens,
+            response_mime_type="application/json" if expect_json else "text/plain"
+        )
+
+        model = genai.GenerativeModel(model_name=model_name, system_instruction=sys_msg)
+
+        # Retry loop for Gemini
+        for attempt in range(3):
+            try:
+                response = model.generate_content(
+                    user_prompt, 
+                    generation_config=gen_config,
+                    safety_settings=safety_config
+                )
+                return response.text.strip()
+            except Exception as e:
+                time.sleep(1 + attempt)
+                if attempt == 2: st.error(f"Gemini API Error: {e}")
+        return ""
 
 # ────────────────────────────────────────────────────────────
 # 7A.  AI Pair‑editor
 # ────────────────────────────────────────────────────────────
-def self_qa(draft, copy_type):
-    if not AUTO_QA:
-        return draft
+def self_qa(draft, copy_type, engine):
+    if not AUTO_QA: return draft
 
     min_len, _ = LENGTH_RULES.get(st.session_state.length_choice, (0, None))
     word_count = len(draft.split())
@@ -323,41 +390,26 @@ def self_qa(draft, copy_type):
         crit = ""
 
     if not crit:
-        crit = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role":"system","content":"You are an obsessive editorial QA bot."},
-                      {"role":"user","content":f"""
-Check copy for:
-• Hard requirements
-• Structure matches {copy_type}
-• Disclaimer present
-Return ONLY “PASS” or bullet fixes.
---- COPY ---
-{draft}
---- END ---
-"""}]
-        ).choices[0].message.content
+        # Step 1: Critique
+        msgs_crit = [{"role":"system","content":"You are an obsessive editorial QA bot."},
+                     {"role":"user","content":f"Check copy for: Hard requirements, Structure matches {copy_type}, Disclaimer present. Return ONLY “PASS” or bullet fixes.\n--- COPY ---\n{draft}"}]
+        
+        crit = run_chat(msgs_crit, engine)
 
     if "PASS" in crit.upper():
         return draft
 
-    patched = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{"role":"system","content":"Revise copy to address feedback."},
-                  {"role":"user","content":f"""
-Apply fixes, output full revised copy ONLY.
-### FIXES
-{crit}
-### ORIGINAL
-{draft}
-"""}]
-    ).choices[0].message.content.strip()
-    return patched
+    # Step 2: Fix
+    msgs_fix = [{"role":"system","content":"Revise copy to address feedback."},
+                {"role":"user","content":f"Apply fixes, output full revised copy ONLY.\n### FIXES\n{crit}\n### ORIGINAL\n{draft}"}]
+    
+    patched = run_chat(msgs_fix, engine)
+    return patched.strip() if patched else draft
 
 # ────────────────────────────────────────────────────────────
 # 7B.  Variant generator helper
 # ────────────────────────────────────────────────────────────
-def generate_variants(base_copy: str, n: int = 5):
+def generate_variants(base_copy: str, engine: str, n: int = 5):
     prompt = f"""
 Write {n} alternative subject‑line/headline ideas AND {n} alternative CTA button labels
 for the copy below, preserving tone and urgency.
@@ -367,14 +419,14 @@ Return JSON: {{ "headlines": [...], "ctas": [...] }}
 {base_copy}
 --- END COPY ---
 """
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{"role":"system","content":"You are a world‑class copywriter."},
-                  {"role":"user","content":prompt}],
-        response_format={"type":"json_object"},
-        temperature=0.8
-    )
-    return json.loads(resp.choices[0].message.content)
+    msgs = [{"role":"system","content":"You are a world‑class copywriter."},
+            {"role":"user","content":prompt}]
+    
+    resp_text = run_chat(msgs, engine, expect_json=True)
+    
+    # Sanitize markdown json blocks if present (Gemini sometimes adds ```json ... ```)
+    clean_text = resp_text.replace("```json", "").replace("```", "").strip()
+    return json.loads(clean_text)
 
 # ────────────────────────────────────────────────────────────
 # 7C.  Smart DOCX Exporter
@@ -407,19 +459,27 @@ def create_docx(text):
 tab_gen, tab_adapt = st.tabs(["✍️ Generate Copy", "🌐 Adapt Copy"])
 
 with tab_gen:
-    with st.sidebar.expander("🎚️ Linguistic Trait Intensity", True):
-        with st.form("trait_form"):
-            trait_scores = {
-                "Urgency":             st.slider("Urgency & Time Sensitivity", 1, 10, 8),
-                "Data_Richness":       st.slider("Data‑Richness & Numerical Emphasis", 1, 10, 7),
-                "Social_Proof":        st.slider("Social Proof & Testimonials", 1, 10, 6),
-                "Comparative_Framing": st.slider("Comparative Framing", 1, 10, 6),
-                "Imagery":             st.slider("Imagery & Metaphors", 1, 10, 7),
-                "Conversational_Tone": st.slider("Conversational Tone", 1, 10, 8),
-                "FOMO":                st.slider("FOMO", 1, 10, 7),
-                "Repetition":          st.slider("Repetition for Emphasis", 1, 10, 5),
-            }
-            update_traits = st.form_submit_button("🔄 Update Copy")
+    # --- Sidebar Controls ---
+    with st.sidebar:
+        st.subheader("🧠 AI Engine")
+        ai_engine = st.radio("Select Model", ["OpenAI (GPT-4)", "Google (Gemini 3)"])
+        
+        if ai_engine == "Google (Gemini 3)" and not GOOGLE_AVAILABLE:
+            st.warning("⚠️ Google API Key not found. Please check secrets.toml")
+
+        with st.expander("🎚️ Linguistic Trait Intensity", True):
+            with st.form("trait_form"):
+                trait_scores = {
+                    "Urgency":             st.slider("Urgency & Time Sensitivity", 1, 10, 8),
+                    "Data_Richness":       st.slider("Data‑Richness & Numerical Emphasis", 1, 10, 7),
+                    "Social_Proof":        st.slider("Social Proof & Testimonials", 1, 10, 6),
+                    "Comparative_Framing": st.slider("Comparative Framing", 1, 10, 6),
+                    "Imagery":             st.slider("Imagery & Metaphors", 1, 10, 7),
+                    "Conversational_Tone": st.slider("Conversational Tone", 1, 10, 8),
+                    "FOMO":                st.slider("FOMO", 1, 10, 7),
+                    "Repetition":          st.slider("Repetition for Emphasis", 1, 10, 5),
+                }
+                update_traits = st.form_submit_button("🔄 Update Copy")
 
     country   = st.selectbox("🌐 Target Country", list(COUNTRY_RULES))
     copy_type = st.selectbox("Copy Type", ["📧 Email", "📝 Sales Page"])
@@ -453,7 +513,7 @@ with tab_gen:
     # ────────── Core generator ────────── #
     def generate(old=None):
         if not hook.strip() or not details.strip():
-            st.warning("⚠️ Please provide at least a 'Campaign Hook' and 'Product Details' before generating.")
+            st.warning("⚠️ Please provide at least a 'Campaign Hook' and 'Product Details'.")
             return None
 
         prompt_core = build_prompt(copy_type, copy_struct,
@@ -479,39 +539,35 @@ with tab_gen:
              "content": user_instr + "\n\n" + prompt_core}
         ]
 
-        with st.spinner("Crafting copy…"):
-            raw_json = run_chat(msgs, expect_json=True)
+        with st.spinner(f"Crafting copy with {ai_engine}…"):
+            raw_json = run_chat(msgs, ai_engine, expect_json=True)
 
         if not raw_json: return None
 
+        # Clean potential markdown wrappers from Gemini
+        clean_json = raw_json.replace("```json", "").replace("```", "").strip()
+
         try:
-            data = json.loads(raw_json)
+            data = json.loads(clean_json)
         except json.JSONDecodeError:
-            data = {"plan": "", "copy": raw_json}
+            data = {"plan": "", "copy": clean_json}
 
         st.session_state.internal_plan = data["plan"].strip()
 
-        # [FIX] Sanitize Newlines: LLMs often double-escape newlines in JSON updates
-        # e.g., turning a real line break into the characters "\n".
+        # Sanitize Newlines
         raw_copy = data["copy"].strip()
         if "\\n" in raw_copy:
              raw_copy = raw_copy.replace("\\n", "\n")
 
         with st.spinner("Polishing copy…"):
-            draft = self_qa(raw_copy, copy_type)
+            draft = self_qa(raw_copy, copy_type, ai_engine)
 
             if show_critique:
-                crit = client.chat.completions.create(
-                    model=OPENAI_MODEL,
-                    messages=[
+                msgs_critique = [
                         {"role": "system", "content": "Give concise, constructive feedback."},
-                        {"role": "user", "content": f"""
-        In 3 bullets – one strength, one weakness, one improvement.
-        --- COPY ---
-        {draft}
-        --- END ---
-        """}]
-                ).choices[0].message.content
+                        {"role": "user", "content": f"In 3 bullets – one strength, one weakness, one improvement.\n--- COPY ---\n{draft}"}
+                ]
+                crit = run_chat(msgs_critique, ai_engine)
                 st.info(crit)
         
         st.session_state.variants = None
@@ -522,7 +578,6 @@ with tab_gen:
         result = generate()
         if result: st.session_state.generated_copy = result
 
-    # The update button logic
     if update_traits and st.session_state.generated_copy:
         result = generate(st.session_state.generated_copy)
         if result: st.session_state.generated_copy = result
@@ -538,20 +593,20 @@ with tab_gen:
         st.code(st.session_state.generated_copy, language="markdown")
 
         if st.button("🎯 Generate 5 Alt Headlines & CTAs", key="gen_variants_btn"):
-            with st.spinner("Brainstorming variants…"):
-                st.session_state.variants = generate_variants(st.session_state.generated_copy)
+            with st.spinner(f"Brainstorming variants with {ai_engine}…"):
+                st.session_state.variants = generate_variants(st.session_state.generated_copy, ai_engine)
 
         if st.session_state.variants:
             st.subheader("📰 Headline Ideas")
             cols = st.columns(5)
-            for i, text in enumerate(st.session_state.variants["headlines"]):
+            for i, text in enumerate(st.session_state.variants.get("headlines", [])):
                 with cols[i]:
                     st.markdown(f"**{i+1}.** {text}")
                     st.radio(f"Vote H{i}", ["👍", "👎"], key=f"h_vote_{i}", horizontal=True, label_visibility="collapsed")
 
             st.subheader("🔘 CTA Button Ideas")
             cols = st.columns(5)
-            for i, text in enumerate(st.session_state.variants["ctas"]):
+            for i, text in enumerate(st.session_state.variants.get("ctas", [])):
                 with cols[i]:
                     st.markdown(f"**{i+1}.** {text}")
                     st.radio(f"Vote C{i}", ["👍", "👎"], key=f"c_vote_{i}", horizontal=True, label_visibility="collapsed")
@@ -595,7 +650,7 @@ with tab_adapt:
              )}
         ]
         with st.spinner("Adapting…"):
-            st.session_state.adapted_copy = run_chat(msgs)
+            st.session_state.adapted_copy = run_chat(msgs, ai_engine)
 
     if st.session_state.adapted_copy:
         st.subheader("🌐 Adapted Copy")
